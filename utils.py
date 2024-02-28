@@ -1,8 +1,14 @@
 from pathlib import Path
 import numpy as np
 import tifffile
-from skimage import measure, io
+from skimage import measure, io, color
+import pyclesperanto_prototype as cle
+import napari_segment_blobs_and_things_with_membranes as nsbatwm
+from skimage import morphology
 import os
+
+# Select a GPU with the following in the name. This will fallback to any other GPU if none with this name is found
+cle.select_device("RTX")
 
 
 def read_images(directory_path):
@@ -68,3 +74,65 @@ def save_min_projection_imgs(images_per_well, output_dir="./output/MIN_projectio
 
         # Save the resulting minimum projection
         tifffile.imwrite(output_path, min_proj)
+
+
+def extract_labels(
+    image_path,
+    top_hat_filter="scikit",
+    filter_radius=20,
+    object_detection="voronoi_otsu_nsbatwm",
+    dilation_radius=2,
+    erosion_radius=2,
+    size_exclusion=True,
+    exclusion_area=30,
+):
+
+    # Load the image
+    image = io.imread(image_path)
+
+    # Convert to grayscale
+    image_gray = color.rgb2gray(image)
+
+    # Rescale to 0-255 and convert to uint8
+    image_gray_uint8 = (image_gray * 255).astype(np.uint8)
+
+    inverted_image = 255 - image_gray_uint8
+
+    # Tophat filtering methods
+    if top_hat_filter == "cle":
+        result_image = None
+        img_gpu = cle.push(inverted_image)
+        result_image = cle.top_hat_box(
+            img_gpu, result_image, radius_x=filter_radius, radius_y=filter_radius
+        )
+        result_image = cle.pull(result_image)
+
+    elif top_hat_filter == "scikit":
+        square_kernel = morphology.square(filter_radius)
+        result_image = morphology.white_tophat(inverted_image, footprint=square_kernel)
+
+    else:
+        print("Choose either 'cle' or 'scikit' filtering methods")
+
+    # Object detection methods (#TODO: implement APOC object_classifier if needed)
+
+    if object_detection == "voronoi_otsu_nsbatwm":
+
+        labels = nsbatwm.voronoi_otsu_labeling(
+            result_image, spot_sigma=4, outline_sigma=1
+        )
+
+    exclude_border = nsbatwm.remove_labels_on_edges(labels)
+
+    dilated_labels = cle.dilate_labels(exclude_border, radius=dilation_radius)
+
+    eroded_labels = cle.erode_labels(dilated_labels, radius=erosion_radius)
+
+    if size_exclusion:
+        output_labels = cle.exclude_small_labels(
+            eroded_labels, maximum_size=exclusion_area
+        )
+    else:
+        output_labels = eroded_labels
+
+    return image_gray_uint8, result_image, output_labels
